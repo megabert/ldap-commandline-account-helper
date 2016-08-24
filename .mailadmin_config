@@ -1,0 +1,13 @@
+#!/bin/bash
+
+BASE_DN="dc=example,dc=com"
+USER_OU="ou=User,$BASE_DN"
+BIND_DN="cn=admin,dc=example,dc=com"
+BIND_PW="secretldapadminpassword"
+
+NEW_GID_START=10000
+NEW_UID_START=20000
+
+MAIL_GID=5000
+MAIL_DOMAIN="example.com"
+

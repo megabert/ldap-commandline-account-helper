@@ -1,0 +1,259 @@
+#!/bin/bash 
+#
+#	LDAP-Mailadmin-Script
+#
+
+[ -f $HOME/.mailadmin_config ] && . $HOME/.mailadmin_config
+set -e
+
+LDAP_OPTS="-x -w $BIND_PW -D $BIND_DN"
+
+export BIND_DN BIND_PW BASE_DN USER_OU NEW_GID_START NEW_UID_START MAIL_GID LDAP_OPTS MAIL_DOMAIN
+
+MAIL_USER_LDIF_TEMPLATE="
+dn: uid===USERNAME==,$USER_OU
+givenName: ==GIVENNAME==
+sn: ==SURNAME==
+mail: ==EMAIL==
+uid: ==USERNAME==
+uidNumber: ==UID==
+gidNumber: $MAIL_GID
+homeDirectory: /home/users/==USERNAME==
+loginShell: /bin/bash
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: top
+cn: ==USERNAME==
+"
+
+export MAIL_USER_LDIF_TEMPLATE
+
+function my_ldap_add {
+
+	DATA="$1"
+        if echo -e "$DATA" | ldapadd $LDAP_OPTS ; then
+		:
+	else
+		echo -e "LDAP Action failed\n"
+	fi
+
+}
+
+function my_ldap_delete {
+
+	DN="$1"
+        if ldapdelete $LDAP_OPTS "$DN" ; then
+		:
+	else
+		echo -e "LDAP Action failed\n"
+	fi
+
+}
+
+function my_ldap_search {
+
+	FILTER="$1"
+	
+        ldapsearch $LDAP_OPTS -b "$BASE_DN" "$FILTER"
+
+}
+
+function ldap_set_passwd_atom {
+
+	USER_DN="$1"
+	PASSWORD="$2"
+	if ldappasswd $LDAP_OPTS -s "$PASSWORD" "$USER_DN" ; then
+		echo "Password change successful"
+	else
+		echo "Password change failed"
+	fi
+
+}
+
+function my_ldap_passwd {
+
+	MY_UID="$1"
+	MY_PASSWD="$2"
+	LDAP_QUERY="(&(objectClass=inetOrgPerson)(uid=$MY_UID))"
+	# echo "$MY_UID"
+	# echo "QUERY: $LDAP_QUERY"
+	USER_DN="$(my_ldap_search "$LDAP_QUERY" | grep -E '^dn:' | head -n1 | awk '{print $2}')"
+	echo "$USER_DN"
+        if [ -z "$USER_DN" ]; 
+		then echo "User $MY_UID not found"
+		return
+	else
+		if [ -z "$MY_PASSWD" ]; then
+			password1="a"
+			password2="b"
+			while :;do
+				echo ""
+				printf "Enter new password for user %s (Password is not shown) : " "$MY_UID"
+				read -s password1
+				echo
+				printf "Please enter new password again %s for verification    : " "$MY_UID"
+				read -s password2
+				echo
+				if [ "$password1" != "$password2" ]; then
+					echo "Passwords do not match. Please try again"
+				else
+					echo 
+					ldap_set_passwd_atom "$USER_DN" "$password1"
+					echo
+					break
+				fi
+			done
+		else
+			echo 
+			ldap_set_passwd_atom "$USER_DN" "$PASSWORD"
+			echo
+		fi
+	fi
+}
+
+function get_ldap_uids_gids {
+
+	ldapsearch -x -w "$BIND_PW" -D "$BIND_DN" -b "$BASE_DN" '(objectClass=inetOrgPerson)' 	\
+		| grep -iE "(gidnumber|uidnumber)"						\
+		| awk '{print $2}' | sort -k +1n| uniq
+}
+
+function get_ldap_uids_gids_pattern {
+
+	echo '^('$(get_ldap_uids_gids| xargs echo  |tr ' ' '|' )')$'
+}
+
+function get_new_uid {
+
+	NEW_UID=$NEW_UID_START
+	EXISTING_IDS="$(get_ldap_uids_gids_pattern)"
+
+	while :; do
+		if echo $NEW_UID | grep -qE $EXISTING_IDS ;then
+			: # echo "$NEW_UID is already in use"
+		else
+			# echo "$NEW_UID is free"
+			NEW_USER_ID="$NEW_UID"
+			break
+		fi
+		((NEW_UID++))
+	done
+
+	if [ -n "$NEW_USER_ID" ]; then
+		echo "$NEW_USER_ID"
+	fi
+	
+}
+
+function ldap_create_new_mail_user {
+
+	USERNAME="$1"
+	GIVENNAME="$2"
+	SURNAME="$3"
+	EMAIL="$4"
+	PASSWORD="$5"
+
+	if [ -z "$EMAIL" ]; then
+		echo "madmin - create: too few paramaters"
+		echo
+		echo "madmin create USERNAME FIRSTNAME FAMILYNAME MAILADDRESS [PASSWORD]"
+		echo 
+		return
+
+	elif ! [[ "$EMAIL" ~ @$MAIL_DOMAIN$ ]]; then
+		
+		echo 
+		echo "Mailaddress must be from domain @$MAIL_DOMAIN"
+		echo 
+		return
+	fi
+	
+	NEW_USER_ID=$(get_new_uid)
+
+	NEW_USER_DATA=$(echo -e "$MAIL_USER_LDIF_TEMPLATE" 	\
+		| sed -r -e "s/==USERNAME==/$USERNAME/g"	\
+			 -e "s/==GIVENNAME==/$GIVENNAME/g" 	\
+			 -e "s/==SURNAME==/$SURNAME/g"		\
+			 -e "s/==EMAIL==/$EMAIL/g"		\
+			 -e "s/==UID==/$NEW_USER_ID/g" )
+
+	my_ldap_add "$NEW_USER_DATA"
+	if [ -z "$PASSWORD" ] ; then 
+		PASSWORD=$(/usr/bin/pwgen 12 1); fi
+		echo "New Password: $PASSWORD"
+	ldap_set_password "$USERNAME" "$PASSWORD"
+		
+}
+
+function ldap_set_password {
+
+	MY_UID="$1"
+	PASSWD="$2"
+	if [ -z "$MY_UID" ]; then
+		echo "madmin - passwd: too few paramaters"
+		echo
+		echo "madmin passwd USERNAME"
+		echo 
+		return
+	fi
+
+	my_ldap_passwd "$MY_UID" "$PASSWD"
+
+}
+
+function ldap_list_users {
+
+	echo "User list"
+	echo
+	my_ldap_search "(&(objectClass=inetOrgPerson)(uid=*))" | grep -E "^uid:" | awk '{print $2}'
+	echo
+
+}
+
+function ldap_delete_user {
+
+        MY_UID="$1"
+        if [ -z "$MY_UID" ]; then
+                echo "madmin - delete: too few paramaters"
+                echo
+                echo "madmin delete USERNAME"
+                echo 
+                return
+        fi
+
+        LDAP_QUERY="(&(objectClass=inetOrgPerson)(uid=$MY_UID))"
+        USER_DN="$(my_ldap_search "$LDAP_QUERY" | grep -E '^dn:' | head -n1 | awk '{print $2}')"
+	echo -e "Deleting $USER_DN ...\n"
+        if [ -z "$USER_DN" ];
+                then echo "User $MY_UID not found"
+                return
+        else
+		my_ldap_delete "$USER_DN"
+	fi
+
+
+}
+
+echo
+echo "madmin - LDAP-Mail Account Management Tool"
+echo 
+
+case "$1" in 
+	create)	shift; ldap_create_new_mail_user "$@"
+		;;
+	delete)	shift; ldap_delete_user "$@"
+		;;
+	passwd)	shift; ldap_set_password "$@"
+		;;
+	list)	shift; ldap_list_users 
+		;;
+		
+	*) 	echo "Wrong invocation"
+		echo ""
+		echo "Usage:"
+		echo "   madmin create USERNAME FIRSTNAME FAMILYNAME MAILADDRESS [PASSWORD]"
+		echo "   madmin delete USERNAME"
+		echo "   madmin passwd USERNAME"
+		echo "   madmin list"
+		echo
+esac
